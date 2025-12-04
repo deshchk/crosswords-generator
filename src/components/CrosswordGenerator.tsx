@@ -5,13 +5,13 @@ interface WordEntry { enabled: boolean, word: string, hint: string }
 interface PasswordChar { char: string, newWord: boolean, gridPosition: { x: number, y: number } | null, isGiven: boolean, number: number }
 interface PlacedWord { word: string, x: number, y: number, direction: Dir }
 interface BeamState { grid: Map<string, string>, placedWords: PlacedWord[], remainingWords: string[], score: number }
-interface GeneratedIteration { id: number, grid: string[][], placedWords: PlacedWord[], score: number, density: number, intersections: number, wordCount: number, totalWords: number }
+interface GeneratedIteration { id: number, grid: string[][], placedWords: PlacedWord[], score: number, density: number, intersections: number, wordCount: number, totalWords: number, avgIntersections: number }
 
 const STORAGE_KEYS = { WORD_ENTRIES: 'crossword_word_entries', PASSWORD: 'crossword_password', HINT: 'crossword_hint' }
 const POLISH_VOWELS = new Set(['A', 'Ą', 'E', 'Ę', 'I', 'O', 'Ó', 'U', 'Y'])
 const POLISH_SPECIAL_CHARS = new Set(['Ą', 'Ć', 'Ę', 'Ł', 'Ń', 'Ó', 'Ś', 'Ź', 'Ż'])
 const CELL_SIZE = 32, SMALL_CELL_SIZE = 24, HINT_CHAR_WIDTH = 5, HINT_LINE_HEIGHT = 16, HELPER_LINE_HEIGHT = 18, WORD_HINT_MAX_WIDTH = 280, GAP = 64
-const GEN_ATTEMPTS = 35
+const GEN_ATTEMPTS = 100
 
 const getPos = (x: number, y: number, i: number, dir: Dir): [number, number] => dir === 'across' ? [x + i, y] : [x, y + i]
 
@@ -57,6 +57,42 @@ const countTotalIntersections = (grid: Map<string, string>, placedWords: PlacedW
   return total / 2
 }
 
+const countIntersectionsPerWord = (grid: Map<string, string>, placedWords: PlacedWord[]): Map<string, number> => {
+  const intersectionsMap = new Map<string, number>()
+  for (const pw of placedWords) {
+    const perp = pw.direction === 'across' ? [[0, -1], [0, 1]] : [[-1, 0], [1, 0]]
+    let count = 0
+    for (let i = 0; i < pw.word.length; i++) {
+      const [cx, cy] = getPos(pw.x, pw.y, i, pw.direction)
+      if (perp.some(([dx, dy]) => grid.has(`${cx + dx},${cy + dy}`))) count++
+    }
+    intersectionsMap.set(pw.word, count)
+  }
+  return intersectionsMap
+}
+
+const countFilledCellsFromGrid = (grid: Map<string, string>): number => {
+  const bounds = getBounds(grid)
+  if (bounds.area <= 1) return 0
+  const width = bounds.width, height = bounds.height
+  const table: string[][] = Array(height).fill(0).map(() => Array(width).fill('-'))
+  for (const [k, v] of grid) { const [x, y] = k.split(',').map(Number); table[y - bounds.minY][x - bounds.minX] = v }
+  const connectedToEdge = new Set<string>(), queue: [number, number][] = []
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) if ((y === 0 || y === height - 1 || x === 0 || x === width - 1) && table[y][x] === '-') { const key = `${x},${y}`; if (!connectedToEdge.has(key)) { connectedToEdge.add(key); queue.push([x, y]) } }
+  while (queue.length) { const [x, y] = queue.shift()!; for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]] as [number, number][]) if (nx >= 0 && nx < width && ny >= 0 && ny < height && !connectedToEdge.has(`${nx},${ny}`) && table[ny][nx] === '-') { connectedToEdge.add(`${nx},${ny}`); queue.push([nx, ny]) } }
+  let filledCount = 0
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) if (table[y][x] === '-' && !connectedToEdge.has(`${x},${y}`)) filledCount++
+  return filledCount
+}
+
+const calculateCompactness = (grid: Map<string, string>): number => {
+  if (grid.size < 2) return 1
+  const bounds = getBounds(grid)
+  const perimeter = 2 * (bounds.width + bounds.height)
+  const idealPerimeter = 4 * Math.sqrt(grid.size)
+  return Math.min(1, idealPerimeter / perimeter)
+}
+
 const findPlacements = (grid: Map<string, string>, word: string, remaining: string[]) => {
   if (!grid.size) return [{ x: 0, y: 0, direction: 'across' as Dir, score: 0, intersections: 0 }, { x: 0, y: 0, direction: 'down' as Dir, score: 0, intersections: 0 }]
   const placements: { x: number, y: number, direction: Dir, score: number, intersections: number }[] = [], seen = new Set<string>(), wordChars = new Set(word), bounds = getBounds(grid)
@@ -81,7 +117,7 @@ const findPlacements = (grid: Map<string, string>, word: string, remaining: stri
         const aspect = Math.min(nW, nH) / Math.max(nW, nH)
         const expansion = nArea / bounds.area
         const futureLinks = [...word].filter(c => remainingChars.has(c)).length
-        const score = intersections * intersections * 200 + density * 100 + aspect * 50 + futureLinks * 10 - (expansion > 1.1 ? (expansion - 1) * 150 : 0)
+        const score = intersections * intersections * 300 + density * 40 + aspect * 40 + futureLinks * 10 - (expansion > 1.1 ? (expansion - 1) * 150 : 0)
         placements.push({ x: sx, y: sy, direction: dir, score, intersections })
       }
     }
@@ -90,27 +126,25 @@ const findPlacements = (grid: Map<string, string>, word: string, remaining: stri
 }
 
 const scoreState = (state: BeamState) => {
-  const bounds = getBounds(state.grid)
-  const density = state.grid.size / bounds.area
-  const intersections = countTotalIntersections(state.grid, state.placedWords)
-  const avgInt = state.placedWords.length > 1 ? intersections / (state.placedWords.length - 1) : 0
-  const aspect = Math.min(bounds.width, bounds.height) / Math.max(bounds.width, bounds.height)
-  return state.placedWords.length * 150 + density * 120 + avgInt * 300 + aspect * 40 - state.remainingWords.length * 20
+  const intersectionsPerWord = countIntersectionsPerWord(state.grid, state.placedWords)
+  let totalWordIntersections = 0
+  for (const [, count] of intersectionsPerWord) { totalWordIntersections += count }
+  const avgIntersections = state.placedWords.length > 0 ? totalWordIntersections / state.placedWords.length : 0
+  const compactness = calculateCompactness(state.grid)
+  return (avgIntersections * compactness * 100)
 }
 
-const beamSearch = async (words: string[], beamWidth: number, initDir: Dir, signal?: { cancelled: boolean }): Promise<BeamState> => {
-  const sorted = [...words].sort((a, b) => b.length - a.length)
+const beamSearch = async (words: string[], beamWidth: number, initDir: Dir): Promise<BeamState> => {
+  const sorted = [...words]
   const seed = sorted[0], initGrid = new Map<string, string>()
   placeWord(initGrid, seed, 0, 0, initDir)
-  let beam: BeamState[] = [{ grid: initGrid, placedWords: [{ word: seed, x: 0, y: 0, direction: initDir }], remainingWords: sorted.slice(1), score: 0 }]
+  let beam: BeamState[] = [{ grid: initGrid, placedWords: [{ word: seed, x: 0, y: 0, direction: initDir }], remainingWords: shuffle(sorted.slice(1)), score: 0 }]
   let noProgress = 0
   while (beam.length && beam[0].remainingWords.length && noProgress < 5) {
-    if (signal?.cancelled) break
     await new Promise(r => setTimeout(r, 0))
     const candidates: BeamState[] = []
     const prevBest = beam[0].placedWords.length
     for (const state of beam.slice(0, 40)) {
-      if (signal?.cancelled) break
       const gridChars = new Set(state.grid.values())
       const wordScores = state.remainingWords.map(w => ({ w, s: [...w].filter(c => gridChars.has(c)).length * 10 + w.length }))
       wordScores.sort((a, b) => b.s - a.s)
@@ -141,10 +175,9 @@ const beamSearch = async (words: string[], beamWidth: number, initDir: Dir, sign
   return beam.reduce((best, c) => c.score > best.score ? c : best, beam[0])
 }
 
-const retryFailed = async (state: BeamState, signal?: { cancelled: boolean }): Promise<BeamState> => {
+const retryFailed = async (state: BeamState): Promise<BeamState> => {
   let cur = state
   for (let r = 0; r < 5 && cur.remainingWords.length; r++) {
-    if (signal?.cancelled) break
     let improved = false
     const gridChars = new Set(cur.grid.values())
     const sorted = [...cur.remainingWords].map(w => ({ w, s: [...w].filter(c => gridChars.has(c)).length })).sort((a, b) => b.s - a.s)
@@ -181,9 +214,38 @@ const wrapText = (text: string, maxWidth: number, charWidth: number): string[] =
   return lines
 }
 
-const getGridHash = (grid: string[][]): string => grid.map(row => row.join('')).join('|')
-const rotateGrid90 = (grid: string[][]): string[][] => { const height = grid.length, width = grid[0]?.length || 0, rotated: string[][] = []; for (let x = 0; x < width; x++) { const newRow: string[] = []; for (let y = height - 1; y >= 0; y--) newRow.push(grid[y][x]); rotated.push(newRow) } return rotated }
-const getAllRotationHashes = (grid: string[][]): Set<string> => { const hashes = new Set<string>(); let current = grid; for (let i = 0; i < 4; i++) { hashes.add(getGridHash(current)); current = rotateGrid90(current) } return hashes }
+const normalizeGrid = (grid: string[][]): string => {
+  const height = grid.length, width = grid[0]?.length || 0
+  const normalized: string[][] = []
+  for (let y = 0; y < height; y++) {
+    const row: string[] = []
+    for (let x = 0; x < width; x++) row.push(grid[y][x])
+    normalized.push(row)
+  }
+  return normalized.map(row => row.join('')).join('|')
+}
+
+const rotateGrid90 = (grid: string[][]): string[][] => {
+  const height = grid.length, width = grid[0]?.length || 0, rotated: string[][] = []
+  for (let x = 0; x < width; x++) { const newRow: string[] = []; for (let y = height - 1; y >= 0; y--) newRow.push(grid[y][x]); rotated.push(newRow) }
+  return rotated
+}
+
+const flipHorizontal = (grid: string[][]): string[][] => grid.map(row => [...row].reverse())
+
+const flipVertical = (grid: string[][]): string[][] => [...grid].reverse().map(row => [...row])
+
+const getAllTransformationHashes = (grid: string[][]): Set<string> => {
+  const hashes = new Set<string>()
+  let current = grid
+  for (let i = 0; i < 4; i++) {
+    hashes.add(normalizeGrid(current))
+    hashes.add(normalizeGrid(flipHorizontal(current)))
+    hashes.add(normalizeGrid(flipVertical(current)))
+    current = rotateGrid90(current)
+  }
+  return hashes
+}
 
 const CrosswordGenerator = () => {
   const [wordEntries, setWordEntries] = useState<WordEntry[]>(() => { try { const saved = localStorage.getItem(STORAGE_KEYS.WORD_ENTRIES); if (saved) { const parsed = JSON.parse(saved); if (Array.isArray(parsed)) return parsed } } catch { /* empty */ } return [] })
@@ -195,15 +257,17 @@ const CrosswordGenerator = () => {
   const [hintInput, setHintInput] = useState(() => { try { return localStorage.getItem(STORAGE_KEYS.HINT) || '' } catch { return '' } })
   const [grid, setGrid] = useState<string[][] | null>(null)
   const [placedWords, setPlacedWords] = useState<PlacedWord[]>([])
+  const [allPlacedWords, setAllPlacedWords] = useState<PlacedWord[]>([])
+  const [hiddenWords, setHiddenWords] = useState<Set<string>>(new Set())
   const [stats, setStats] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
-  const cancelRef = useRef({ cancelled: false })
   const svgRef = useRef<SVGSVGElement>(null)
   const iterationsRef = useRef<HTMLDivElement | null>(null)
   const [hideWords, setHideWords] = useState(true)
   const [revealedLetters, setRevealedLetters] = useState<Set<string>>(new Set())
   const [indicateVowels, setIndicateVowels] = useState(false)
   const [indicatePolishChars, setIndicatePolishChars] = useState(false)
+  const generationProgress = useRef(0)
   const [generatedIterations, setGeneratedIterations] = useState<GeneratedIteration[]>([])
   const [selectedIterationIndex, setSelectedIterationIndex] = useState(0)
   const [iterationsExpanded, setIterationsExpanded] = useState(false)
@@ -214,7 +278,7 @@ const CrosswordGenerator = () => {
 
   const uniqueLetters = [...new Set(placedWords.flatMap(pw => pw.word.split('')))].sort()
   const enabledCount = wordEntries.filter(e => e.enabled).length
-  const sorted = placedWords.slice().sort((a, b) => a.word.localeCompare(b.word))
+  const sorted = allPlacedWords.slice().sort((a, b) => a.word.localeCompare(b.word))
   const filledCells = getFilledCells(grid)
 
   const preparePassword = (input: string) => input.split('').map((ch, i) => ({ char: ch.trim() || '', newWord: !input.charAt(i - 1).trim() })).filter(c => c.char)
@@ -231,18 +295,23 @@ const CrosswordGenerator = () => {
 
   const rebuildGrid = (words: PlacedWord[]) => { const g = new Map<string, string>(); words.forEach(pw => placeWord(g, pw.word, pw.x, pw.y, pw.direction)); return g }
 
-  const updateDisplay = (words: PlacedWord[]) => {
+  const updateDisplay = (words: PlacedWord[], allWords?: PlacedWord[]) => {
     if (!words.length) { setGrid(null); setPassword([]); setGridNumbers(new Map()); setPlacedWords([]); setStats('All words removed.'); return }
     const g = rebuildGrid(words), b = getBounds(g)
     const table: string[][] = Array(b.height).fill(0).map(() => Array(b.width).fill('-'))
     for (const [k, v] of g) { const [x, y] = k.split(',').map(Number); table[y - b.minY][x - b.minX] = v }
     const norm = words.map(pw => ({ ...pw, x: pw.x - b.minX, y: pw.y - b.minY }))
     setGrid(table); setPlacedWords(norm)
+    if (allWords) {
+      const normAll = allWords.map(pw => ({ ...pw, x: pw.x - b.minX, y: pw.y - b.minY }))
+      setAllPlacedWords(normAll)
+    }
     const { password: p, numbers: n } = assignPassPositions(table, preparePassword(passwordInput))
     setPassword(p); setGridNumbers(n)
     const density = (g.size / b.area) * 100
     const intersections = countTotalIntersections(g, words)
-    setStats(`Words: ${words.length} | Density: ${density.toFixed(1)}% | Intersections: ${intersections}`)
+    const avgInt = words.length > 0 ? (intersections * 2 / words.length).toFixed(2) : '0'
+    setStats(`Words: ${words.length} | Density: ${density.toFixed(1)}% | Avg intersections: ${avgInt} | Intersections: ${intersections}`)
   }
 
   const findConnected = (words: PlacedWord[]) => {
@@ -256,7 +325,23 @@ const CrosswordGenerator = () => {
     return words.filter(w => visited.has(w.word))
   }
 
-  const removeWord = (word: string) => updateDisplay(findConnected(placedWords.filter(p => p.word !== word)))
+  const toggleWordVisibility = (word: string) => {
+    const newHidden = new Set(hiddenWords)
+    if (newHidden.has(word)) {
+      newHidden.delete(word)
+    } else {
+      newHidden.add(word)
+    }
+    const visibleWords = allPlacedWords.filter(pw => !newHidden.has(pw.word))
+    const connected = findConnected(visibleWords)
+    const disconnectedWords = visibleWords.filter(pw => !connected.some(c => c.word === pw.word))
+    for (const pw of disconnectedWords) {
+      newHidden.add(pw.word)
+    }
+    setHiddenWords(newHidden)
+    updateDisplay(connected, allPlacedWords)
+  }
+
   const toggleEnabled = (i: number) => setWordEntries(p => p.map((e, j) => j === i ? { ...e, enabled: !e.enabled } : e))
   const updateWord = (i: number, word: string) => setWordEntries(p => p.map((e, j) => j === i ? { ...e, word } : e))
   const updateHint = (i: number, hint: string) => setWordEntries(p => p.map((e, j) => j === i ? { ...e, hint } : e))
@@ -266,7 +351,12 @@ const CrosswordGenerator = () => {
   const selectAllEntries = () => setWordEntries(p => p.map(e => ({ ...e, enabled: p.some(e => !e.enabled) })))
   const removeAllEntries = () => setWordEntries([])
 
-  const rotateGrid = () => { if (!placedWords.length) return; updateDisplay(placedWords.map(pw => ({ ...pw, direction: (pw.direction === 'across' ? 'down' : 'across') as Dir, x: pw.y, y: pw.x }))) }
+  const rotateGrid = () => {
+    if (!placedWords.length) return
+    const rotatedVisible = placedWords.map(pw => ({ ...pw, direction: (pw.direction === 'across' ? 'down' : 'across') as Dir, x: pw.y, y: pw.x }))
+    const rotatedAll = allPlacedWords.map(pw => ({ ...pw, direction: (pw.direction === 'across' ? 'down' : 'across') as Dir, x: pw.y, y: pw.x }))
+    updateDisplay(rotatedVisible, rotatedAll)
+  }
 
   const handleHideWordsChange = (checked: boolean) => { setHideWords(checked); if (!checked) { setRevealedLetters(new Set()); setIndicateVowels(false); setIndicatePolishChars(false) } }
   const handleRevealedLettersChange = (e: ChangeEvent<HTMLSelectElement>) => { const selected = new Set(Array.from(e.target.selectedOptions, o => o.value)); setRevealedLetters(selected); if (selected.size > 0) { setIndicateVowels(false); setIndicatePolishChars(false) } }
@@ -280,55 +370,61 @@ const CrosswordGenerator = () => {
 
   const selectIteration = (index: number) => {
     const iteration = generatedIterations[index]; if (!iteration) return
-    setSelectedIterationIndex(index); setGrid(iteration.grid); setPlacedWords(iteration.placedWords)
+    setSelectedIterationIndex(index); setGrid(iteration.grid); setPlacedWords(iteration.placedWords); setAllPlacedWords(iteration.placedWords); setHiddenWords(new Set())
     const { password: p, numbers: n } = assignPassPositions(iteration.grid, preparePassword(passwordInput))
     setPassword(p); setGridNumbers(n)
-    setStats(`Iteracja ${iteration.id} ${isIterationBest(index) ? '(najlepsza)' : ''} | Density: ${iteration.density.toFixed(1)}% | Intersections: ${iteration.intersections} | Words: ${iteration.wordCount}/${iteration.totalWords}`)
+    setStats(`Iteracja ${iteration.id} ${isIterationBest(index) ? '(najlepsza)' : ''} | Avg intersections: ${iteration.avgIntersections.toFixed(2)} | Words: ${iteration.wordCount}/${iteration.totalWords}`)
   }
 
   const handleGenerate = async () => {
     const words = wordEntries.filter(e => e.enabled && e.word.trim().length > 1).map(e => e.word.trim().toUpperCase())
     if (!words.length) return alert('Please enter at least one word')
     const prepPwd = preparePassword(passwordInput)
-    cancelRef.current = { cancelled: false }
-    setIsGenerating(true); setGrid(null); setPassword([]); setGridNumbers(new Map()); setPlacedWords([]); setStats('Rozpoczynam generowanie krzyżówki...'); setRevealedLetters(new Set()); setIndicateVowels(false); setIndicatePolishChars(false); setHideWords(true); setGeneratedIterations([]); setSelectedIterationIndex(0); setIterationsExpanded(false)
+    setIsGenerating(true); setGrid(null); setPassword([]); setGridNumbers(new Map()); setPlacedWords([]); setAllPlacedWords([]); setHiddenWords(new Set()); setStats('Rozpoczynam generowanie krzyżówki...'); setRevealedLetters(new Set()); setIndicateVowels(false); setIndicatePolishChars(false); setHideWords(true); setGeneratedIterations([]); setSelectedIterationIndex(0); setIterationsExpanded(false)
     let best: BeamState | null = null, bestScore = -Infinity
     const allIterations: GeneratedIteration[] = [], seenGridHashes = new Set<string>()
     for (let i = 0; i < GEN_ATTEMPTS; i++) {
-      if (cancelRef.current.cancelled) { setStats('Generation stopped.'); break }
+      generationProgress.current = i+1
       setStats(`Generowanie iteracji ${i + 1}/${GEN_ATTEMPTS}...`); await new Promise(r => setTimeout(r, 10))
       try {
-        const searchResult = await beamSearch(shuffle(words), 300, Math.random() > 0.5 ? 'across' : 'down', cancelRef.current)
-        if (cancelRef.current.cancelled) break
-        const result = await retryFailed(searchResult, cancelRef.current)
-        if (cancelRef.current.cancelled) break
+        const searchResult = await beamSearch(shuffle(words), 300, Math.random() > 0.5 ? 'across' : 'down')
+        const result = await retryFailed(searchResult)
         const b = getBounds(result.grid)
         const density = (result.grid.size / b.area) * 100
+        const intersectionsPerWord = countIntersectionsPerWord(result.grid, result.placedWords)
+        let totalWordIntersections = 0
+        for (const [, count] of intersectionsPerWord) { totalWordIntersections += count }
+        const avgIntersections = result.placedWords.length > 0 ? totalWordIntersections / result.placedWords.length : 0
         const intersections = countTotalIntersections(result.grid, result.placedWords)
-        const score = result.placedWords.length * 100 + density * 50 + intersections * 30
+        const filledCellsCount = countFilledCellsFromGrid(result.grid)
+        const compactness = calculateCompactness(result.grid)
+
+        const score = (avgIntersections * compactness * 100) + (b.area/4+filledCellsCount) + density/5
+
         const table: string[][] = Array(b.height).fill(0).map(() => Array(b.width).fill('-'))
         for (const [k, v] of result.grid) { const [x, y] = k.split(',').map(Number); table[y - b.minY][x - b.minX] = v }
         const normalizedWords = result.placedWords.map(pw => ({ ...pw, x: pw.x - b.minX, y: pw.y - b.minY }))
-        const rotationHashes = getAllRotationHashes(table)
-        let isDuplicate = false; for (const hash of rotationHashes) if (seenGridHashes.has(hash)) { isDuplicate = true; break }
+        const transformationHashes = getAllTransformationHashes(table)
+        let isDuplicate = false; for (const hash of transformationHashes) if (seenGridHashes.has(hash)) { isDuplicate = true; break }
         if (!isDuplicate) {
-          for (const hash of rotationHashes) seenGridHashes.add(hash)
-          allIterations.push({ id: i + 1, grid: table, placedWords: normalizedWords, score, density, intersections, wordCount: result.placedWords.length, totalWords: words.length })
+          for (const hash of transformationHashes) seenGridHashes.add(hash)
+          allIterations.push({ id: i + 1, grid: table, placedWords: normalizedWords, score, density, intersections, wordCount: result.placedWords.length, totalWords: words.length, avgIntersections })
           setGeneratedIterations([...allIterations])
         }
-        if (score > bestScore) { bestScore = score; best = result; setSelectedIterationIndex(allIterations.length - 1); if (density > 60 && result.placedWords.length >= words.length * 0.9) break }
+        if (score > bestScore) { bestScore = score; best = result; setSelectedIterationIndex(allIterations.length - 1) }
       } catch (err) { console.error('Generation error:', err) }
       await new Promise(r => setTimeout(r, 50))
     }
     setIsGenerating(false)
+    generationProgress.current = 0
     if (best?.grid.size && allIterations.length > 0) {
       const bestIterationIndex = allIterations.reduce((bestIdx, iter, idx, arr) => iter.score > arr[bestIdx].score ? idx : bestIdx, 0), bestIteration = allIterations[bestIterationIndex]
       if (bestIteration) {
-        setGrid(bestIteration.grid); setPlacedWords(bestIteration.placedWords); setSelectedIterationIndex(bestIterationIndex)
+        setGrid(bestIteration.grid); setPlacedWords(bestIteration.placedWords); setAllPlacedWords(bestIteration.placedWords); setHiddenWords(new Set()); setSelectedIterationIndex(bestIterationIndex)
         const { password: p, numbers: n } = assignPassPositions(bestIteration.grid, prepPwd); setPassword(p); setGridNumbers(n)
-        setStats(`✅ Zakończono: Density: ${bestIteration.density.toFixed(1)}% | Intersections: ${bestIteration.intersections} | Words: ${bestIteration.wordCount}/${bestIteration.totalWords}`)
+        setStats(`✅ Zakończono: Avg intersections: ${bestIteration.avgIntersections.toFixed(2)} | Words: ${bestIteration.wordCount}/${bestIteration.totalWords}`)
       }
-    } else if (!cancelRef.current.cancelled) setStats('❌ Nie udało się wygenerować krzyżówki. Spróbuj ponownie.')
+    } else setStats('❌ Nie udało się wygenerować krzyżówki. Spróbuj ponownie.')
   }
 
   const downloadSVG = () => {
@@ -351,9 +447,10 @@ const CrosswordGenerator = () => {
   const renderCrosswordSVG = () => {
     if (!grid || !placedWords.length) return null
     const gridWidth = grid[0].length * CELL_SIZE, gridHeight = grid.length * CELL_SIZE
+    const visibleSorted = placedWords.slice().sort((a, b) => a.word.localeCompare(b.word))
     const hintsContent: { lines: string[], yOffset: number }[] = []
     let currentY = 0
-    for (const pw of sorted) { const hintText = !hideWords ? `${pw.word.toLowerCase()} – ${getHint(pw.word)}` : getHint(pw.word); const wrapped = wrapText(hintText, WORD_HINT_MAX_WIDTH, HINT_CHAR_WIDTH); hintsContent.push({ lines: wrapped, yOffset: currentY }); currentY += wrapped.length * HINT_LINE_HEIGHT + 4 }
+    for (const pw of visibleSorted) { const hintText = !hideWords ? `${pw.word.toLowerCase()} – ${getHint(pw.word)}` : getHint(pw.word); const wrapped = wrapText(hintText, WORD_HINT_MAX_WIDTH, HINT_CHAR_WIDTH); hintsContent.push({ lines: wrapped, yOffset: currentY }); currentY += wrapped.length * HINT_LINE_HEIGHT + 4 }
     const hintsHeight = currentY, helperText = getHelperTextString(), helperLines = helperText ? wrapText(helperText, WORD_HINT_MAX_WIDTH, HINT_CHAR_WIDTH) : [], solutionLines = wrapText(`Rozwiązaniem jest ${hintInput}`, WORD_HINT_MAX_WIDTH, HINT_CHAR_WIDTH)
     const passwordWidth = password.length * SMALL_CELL_SIZE, passwordSectionHeight = helperLines.length * HINT_LINE_HEIGHT + solutionLines.length * HINT_LINE_HEIGHT + 20 + SMALL_CELL_SIZE + 20
     const hintsX = gridWidth + GAP, passwordY = Math.max(gridHeight, hintsHeight) + 40
@@ -393,10 +490,9 @@ const CrosswordGenerator = () => {
       {isBest && <div className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center shadow-lg"><svg className="w-3.5 h-3.5 text-white" fill="currentColor" viewBox="0 0 20 20"><path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" /></svg></div>}
       <div className="flex items-center justify-between mb-2"><span className={`text-sm font-bold ${isSelected || (!isButton && isBest) ? 'text-indigo-300' : 'text-slate-300'}`}>#{sortedIndex + 1}</span><span className="text-xs text-slate-500">iter {iter.id}</span></div>
       <div className="space-y-1">
-        <div className="flex justify-between text-xs"><span className="text-slate-500">Gęstość:</span><span className={`font-mono ${iter.density > 50 ? 'text-emerald-400' : iter.density > 35 ? 'text-amber-400' : 'text-red-400'}`}>{iter.density.toFixed(1)}%</span></div>
-        <div className="flex justify-between text-xs"><span className="text-slate-500">Przecięcia:</span><span className={`font-mono ${iter.intersections > 10 ? 'text-emerald-400' : iter.intersections > 5 ? 'text-amber-400' : 'text-red-400'}`}>{iter.intersections}</span></div>
-        <div className="flex justify-between text-xs"><span className="text-slate-500">Słowa:</span><span className={`font-mono ${iter.wordCount === iter.totalWords ? 'text-emerald-400' : 'text-slate-300'}`}>{iter.wordCount}/{iter.totalWords}</span></div>
-        <div className="flex justify-between text-xs"><span className="text-slate-500">Wynik:</span><span className="font-mono text-slate-400">{iter.score.toFixed(0)}</span></div>
+        <div className="flex justify-between text-xs"><span className="text-slate-500">Gęstość:</span><span className={`font-mono ${iter.density >= 50 ? 'text-emerald-400' : iter.density > 30 ? 'text-amber-400' : 'text-red-400'}`}>{iter.density.toFixed(1)}%</span></div>
+        <div className="flex justify-between text-xs"><span className="text-slate-500">Przecięcia:</span><span className={`font-mono ${iter.avgIntersections > 2.25 ? 'text-emerald-400' : iter.avgIntersections > 2.15 ? 'text-amber-400' : 'text-red-400'}`}>{iter.intersections} ({iter.avgIntersections.toFixed(2)})</span></div>
+        <div className="flex justify-between text-xs"><span className="text-slate-500">Wynik:</span><span className="font-mono text-slate-400">{iter.score.toFixed(2)}</span></div>
       </div>
     </>
     return isButton ? <button key={iter.id} onClick={() => selectIteration(originalIndex)} className={className}>{content}</button> : <div key={iter.id} className={className}>{content}</div>
@@ -457,12 +553,12 @@ const CrosswordGenerator = () => {
                   <div className="relative"><div className="w-12 h-12 rounded-full border-4 border-amber-500/30 border-t-amber-500 animate-spin"></div><div className="absolute inset-0 flex items-center justify-center"><svg className="w-5 h-5 text-amber-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg></div></div>
                   <div className="flex-1"><p className="text-amber-400 font-semibold mb-1">Generowanie krzyżówki...</p><p className="text-slate-400 text-sm">{stats}</p></div>
                 </div>
-                {generatedIterations.length > 0 && <div className="mt-4 pt-4 border-t border-amber-500/20"><div className="flex items-center justify-between text-sm"><span className="text-slate-400">Znaleziono unikatowych iteracji:</span><span className="text-amber-400 font-mono font-bold">{generatedIterations.length}</span></div><div className="mt-2 h-2 bg-slate-700/50 rounded-full overflow-hidden"><div className="h-full bg-gradient-to-r from-amber-400 to-orange-500 transition-all duration-300 rounded" style={{ width: `${(generatedIterations.length / GEN_ATTEMPTS) * 100}%` }}></div></div></div>}
+                {generatedIterations.length > 0 && <div className="mt-4 pt-4 border-t border-amber-500/20"><div className="flex items-center justify-between text-sm"><span className="text-slate-400">Znaleziono unikatowych iteracji:</span><span className="text-amber-400 font-mono font-bold">{generatedIterations.length}</span></div><div className="mt-2 h-2 bg-slate-700/50 rounded-full overflow-hidden"><div className="h-full bg-gradient-to-r from-amber-400 to-orange-500 transition-all duration-300 rounded" style={{ width: `${(generationProgress.current / (GEN_ATTEMPTS)) * 100}%` }}></div></div></div>}
               </div>
             ) : (
               <div className="flex gap-3"><button className={`flex-1 py-3.5 px-6 rounded-xl font-semibold text-white transition-all duration-300 flex items-center justify-center gap-2 shadow-xl ${isGenerating ? 'bg-gradient-to-r from-amber-600 to-orange-600' : 'bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 hover:shadow-amber-500/30 hover:scale-[1.02]'}`} onClick={handleGenerate} disabled={isGenerating}><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>Generuj</button></div>
             )}
-            {!isGenerating && stats && <div className={`p-4 rounded-xl border grid place-items-center text-center ${stats.includes('✅') ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : stats.includes('stopped') || stats.includes('❌') ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-slate-700/30 border-slate-600/30 text-slate-300'}`}><p className="text-sm font-mono">{stats}</p></div>}
+            {!isGenerating && stats && <div className={`p-4 rounded-xl border grid place-items-center text-center ${stats.includes('✅') ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : stats.includes('❌') ? 'bg-red-500/10 border-red-500/30 text-red-400' : 'bg-slate-700/30 border-slate-600/30 text-slate-300'}`}><p className="text-sm font-mono">{stats}</p></div>}
           </div>
         </div>
         {isGenerating && generatedIterations.length > 0 && (
@@ -489,8 +585,8 @@ const CrosswordGenerator = () => {
         {!isGenerating && grid && placedWords.length > 0 && (
           <div className="grid lg:grid-cols-2 gap-6 mb-8">
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700/50 shadow-xl overflow-hidden flex flex-col">
-              <div className="px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center justify-between"><div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-rose-400 to-pink-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" /></svg></div><h2 className="text-lg font-semibold text-white">Umieszczone słowa</h2></div><span className="px-3 py-1 rounded-full text-xs font-medium bg-rose-500/20 text-rose-400 border border-rose-500/30">{placedWords.length} słów</span></div>
-              <div className="p-5 flex-1 overflow-y-auto max-h-[219px]"><div className="flex flex-wrap gap-2">{sorted.map((pw, i) => <button key={i} onClick={() => removeWord(pw.word)} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-700/50 hover:bg-red-500/20 text-slate-300 hover:text-red-400 rounded-lg text-xs font-mono transition-all duration-200 border border-slate-600/30 hover:border-red-500/30 group" title={`Usuń "${pw.word}"`}>{pw.word.toLowerCase()}<svg className="w-3 h-3 opacity-50 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>)}</div></div>
+              <div className="px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center justify-between"><div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-rose-400 to-pink-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" /></svg></div><h2 className="text-lg font-semibold text-white">Umieszczone słowa</h2></div><span className="px-3 py-1 rounded-full text-xs font-medium bg-rose-500/20 text-rose-400 border border-rose-500/30">{placedWords.length}/{allPlacedWords.length} słów</span></div>
+              <div className="p-5 flex-1 overflow-y-auto max-h-[219px]"><div className="flex flex-wrap gap-2">{sorted.map((pw, i) => { const isHidden = hiddenWords.has(pw.word); return <button key={i} onClick={() => toggleWordVisibility(pw.word)} className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono transition-all duration-200 border group ${isHidden ? 'bg-slate-800/50 text-slate-500 border-slate-700/30 hover:bg-slate-700/50 hover:text-slate-400' : 'bg-slate-700/50 hover:bg-amber-500/20 text-slate-300 hover:text-amber-400 border-slate-600/30 hover:border-amber-500/30'}`} title={isHidden ? `Przywróć "${pw.word}"` : `Ukryj "${pw.word}"`}>{pw.word.toLowerCase()}{isHidden ? <svg className="w-3.5 h-3.5 opacity-50 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg> : <svg className="w-3.5 h-3.5 opacity-50 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>}</button> })}</div></div>
             </div>
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700/50 shadow-xl overflow-hidden flex flex-col">
               <div className="px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg></div><h2 className="text-lg font-semibold text-white">Opcje wyświetlania</h2></div>
