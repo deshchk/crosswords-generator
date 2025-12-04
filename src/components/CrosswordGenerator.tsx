@@ -12,6 +12,7 @@ const POLISH_VOWELS = new Set(['A', 'Ą', 'E', 'Ę', 'I', 'O', 'Ó', 'U', 'Y'])
 const POLISH_SPECIAL_CHARS = new Set(['Ą', 'Ć', 'Ę', 'Ł', 'Ń', 'Ó', 'Ś', 'Ź', 'Ż'])
 const CELL_SIZE = 32, SMALL_CELL_SIZE = 24, HINT_CHAR_WIDTH = 5, HINT_LINE_HEIGHT = 16, HELPER_LINE_HEIGHT = 18, WORD_HINT_MAX_WIDTH = 280, GAP = 64
 const GEN_ATTEMPTS = 100
+const TOP_ITERATIONS_COUNT = 10
 
 const getPos = (x: number, y: number, i: number, dir: Dir): [number, number] => dir === 'across' ? [x + i, y] : [x, y + i]
 
@@ -135,16 +136,15 @@ const scoreState = (state: BeamState) => {
 }
 
 const beamSearch = async (words: string[], beamWidth: number, initDir: Dir): Promise<BeamState> => {
-  const sorted = [...words]
-  const seed = sorted[0], initGrid = new Map<string, string>()
+  const seed = words[0], initGrid = new Map<string, string>()
   placeWord(initGrid, seed, 0, 0, initDir)
-  let beam: BeamState[] = [{ grid: initGrid, placedWords: [{ word: seed, x: 0, y: 0, direction: initDir }], remainingWords: shuffle(sorted.slice(1)), score: 0 }]
+  let beam: BeamState[] = [{ grid: initGrid, placedWords: [{ word: seed, x: 0, y: 0, direction: initDir }], remainingWords: shuffle([...words].slice(1)), score: 0 }]
   let noProgress = 0
   while (beam.length && beam[0].remainingWords.length && noProgress < 5) {
     await new Promise(r => setTimeout(r, 0))
     const candidates: BeamState[] = []
     const prevBest = beam[0].placedWords.length
-    for (const state of beam.slice(0, 40)) {
+    for (const state of beam) {
       const gridChars = new Set(state.grid.values())
       const wordScores = state.remainingWords.map(w => ({ w, s: [...w].filter(c => gridChars.has(c)).length * 10 + w.length }))
       wordScores.sort((a, b) => b.s - a.s)
@@ -259,6 +259,7 @@ const CrosswordGenerator = () => {
   const [placedWords, setPlacedWords] = useState<PlacedWord[]>([])
   const [allPlacedWords, setAllPlacedWords] = useState<PlacedWord[]>([])
   const [hiddenWords, setHiddenWords] = useState<Set<string>>(new Set())
+  const [disconnectedHiddenWords, setDisconnectedHiddenWords] = useState<Set<string>>(new Set())
   const [stats, setStats] = useState('')
   const [isGenerating, setIsGenerating] = useState(false)
   const svgRef = useRef<SVGSVGElement>(null)
@@ -280,6 +281,9 @@ const CrosswordGenerator = () => {
   const enabledCount = wordEntries.filter(e => e.enabled).length
   const sorted = allPlacedWords.slice().sort((a, b) => a.word.localeCompare(b.word))
   const filledCells = getFilledCells(grid)
+
+  const sortedIterations = [...generatedIterations].sort((a, b) => b.score - a.score)
+  const topIterations = sortedIterations.slice(0, TOP_ITERATIONS_COUNT)
 
   const preparePassword = (input: string) => input.split('').map((ch, i) => ({ char: ch.trim() || '', newWord: !input.charAt(i - 1).trim() })).filter(c => c.char)
 
@@ -326,6 +330,7 @@ const CrosswordGenerator = () => {
   }
 
   const toggleWordVisibility = (word: string) => {
+    if (disconnectedHiddenWords.has(word)) return
     const newHidden = new Set(hiddenWords)
     if (newHidden.has(word)) {
       newHidden.delete(word)
@@ -335,10 +340,13 @@ const CrosswordGenerator = () => {
     const visibleWords = allPlacedWords.filter(pw => !newHidden.has(pw.word))
     const connected = findConnected(visibleWords)
     const disconnectedWords = visibleWords.filter(pw => !connected.some(c => c.word === pw.word))
+    const newDisconnectedHidden = new Set<string>()
     for (const pw of disconnectedWords) {
       newHidden.add(pw.word)
+      newDisconnectedHidden.add(pw.word)
     }
     setHiddenWords(newHidden)
+    setDisconnectedHiddenWords(newDisconnectedHidden)
     updateDisplay(connected, allPlacedWords)
   }
 
@@ -363,14 +371,28 @@ const CrosswordGenerator = () => {
   const handleIndicateVowelsChange = (checked: boolean) => { if (checked) { setRevealedLetters(new Set()); setIndicatePolishChars(false) } setIndicateVowels(checked) }
   const handleIndicatePolishCharsChange = (checked: boolean) => { if (checked) { setRevealedLetters(new Set()); setIndicateVowels(false) } setIndicatePolishChars(checked) }
 
-  const prevIteration = () => selectIteration(selectedIterationIndex === 0 ? generatedIterations.length-1 : selectedIterationIndex - 1)
-  const nextIteration = () => selectIteration(selectedIterationIndex+1 === generatedIterations.length ? 0 : selectedIterationIndex + 1)
+  const currentTopIndex = generatedIterations[selectedIterationIndex] ? topIterations.findIndex(iter => iter.id === generatedIterations[selectedIterationIndex].id) : 0
+
+  const prevIteration = () => {
+    const newTopIndex = currentTopIndex === 0 ? topIterations.length - 1 : currentTopIndex - 1
+    const targetIteration = topIterations[newTopIndex]
+    const originalIndex = generatedIterations.findIndex(iter => iter.id === targetIteration.id)
+    selectIteration(originalIndex)
+  }
+
+  const nextIteration = () => {
+    const newTopIndex = currentTopIndex + 1 === topIterations.length ? 0 : currentTopIndex + 1
+    const targetIteration = topIterations[newTopIndex]
+    const originalIndex = generatedIterations.findIndex(iter => iter.id === targetIteration.id)
+    selectIteration(originalIndex)
+  }
+
   const scrollToIterations = () => { setIterationsExpanded(true); iterationsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }
   const isIterationBest = (index: number) => index === generatedIterations.reduce((bestIdx, iter, idx, arr) => iter.score > arr[bestIdx].score ? idx : bestIdx, 0)
 
   const selectIteration = (index: number) => {
     const iteration = generatedIterations[index]; if (!iteration) return
-    setSelectedIterationIndex(index); setGrid(iteration.grid); setPlacedWords(iteration.placedWords); setAllPlacedWords(iteration.placedWords); setHiddenWords(new Set())
+    setSelectedIterationIndex(index); setGrid(iteration.grid); setPlacedWords(iteration.placedWords); setAllPlacedWords(iteration.placedWords); setHiddenWords(new Set()); setDisconnectedHiddenWords(new Set())
     const { password: p, numbers: n } = assignPassPositions(iteration.grid, preparePassword(passwordInput))
     setPassword(p); setGridNumbers(n)
     setStats(`Iteracja ${iteration.id} ${isIterationBest(index) ? '(najlepsza)' : ''} | Avg intersections: ${iteration.avgIntersections.toFixed(2)} | Words: ${iteration.wordCount}/${iteration.totalWords}`)
@@ -380,7 +402,7 @@ const CrosswordGenerator = () => {
     const words = wordEntries.filter(e => e.enabled && e.word.trim().length > 1).map(e => e.word.trim().toUpperCase())
     if (!words.length) return alert('Please enter at least one word')
     const prepPwd = preparePassword(passwordInput)
-    setIsGenerating(true); setGrid(null); setPassword([]); setGridNumbers(new Map()); setPlacedWords([]); setAllPlacedWords([]); setHiddenWords(new Set()); setStats('Rozpoczynam generowanie krzyżówki...'); setRevealedLetters(new Set()); setIndicateVowels(false); setIndicatePolishChars(false); setHideWords(true); setGeneratedIterations([]); setSelectedIterationIndex(0); setIterationsExpanded(false)
+    setIsGenerating(true); setGrid(null); setPassword([]); setGridNumbers(new Map()); setPlacedWords([]); setAllPlacedWords([]); setHiddenWords(new Set()); setDisconnectedHiddenWords(new Set()); setStats('Rozpoczynam generowanie krzyżówki...'); setRevealedLetters(new Set()); setIndicateVowels(false); setIndicatePolishChars(false); setHideWords(true); setGeneratedIterations([]); setSelectedIterationIndex(0); setIterationsExpanded(false)
     let best: BeamState | null = null, bestScore = -Infinity
     const allIterations: GeneratedIteration[] = [], seenGridHashes = new Set<string>()
     for (let i = 0; i < GEN_ATTEMPTS; i++) {
@@ -399,7 +421,7 @@ const CrosswordGenerator = () => {
         const filledCellsCount = countFilledCellsFromGrid(result.grid)
         const compactness = calculateCompactness(result.grid)
 
-        const score = (avgIntersections * compactness * 100) + (b.area/4+filledCellsCount) + density/5
+        const score = (avgIntersections * compactness * 100) + (b.area/4+filledCellsCount) * density/4
 
         const table: string[][] = Array(b.height).fill(0).map(() => Array(b.width).fill('-'))
         for (const [k, v] of result.grid) { const [x, y] = k.split(',').map(Number); table[y - b.minY][x - b.minX] = v }
@@ -420,7 +442,7 @@ const CrosswordGenerator = () => {
     if (best?.grid.size && allIterations.length > 0) {
       const bestIterationIndex = allIterations.reduce((bestIdx, iter, idx, arr) => iter.score > arr[bestIdx].score ? idx : bestIdx, 0), bestIteration = allIterations[bestIterationIndex]
       if (bestIteration) {
-        setGrid(bestIteration.grid); setPlacedWords(bestIteration.placedWords); setAllPlacedWords(bestIteration.placedWords); setHiddenWords(new Set()); setSelectedIterationIndex(bestIterationIndex)
+        setGrid(bestIteration.grid); setPlacedWords(bestIteration.placedWords); setAllPlacedWords(bestIteration.placedWords); setHiddenWords(new Set()); setDisconnectedHiddenWords(new Set()); setSelectedIterationIndex(bestIterationIndex)
         const { password: p, numbers: n } = assignPassPositions(bestIteration.grid, prepPwd); setPassword(p); setGridNumbers(n)
         setStats(`✅ Zakończono: Avg intersections: ${bestIteration.avgIntersections.toFixed(2)} | Words: ${bestIteration.wordCount}/${bestIteration.totalWords}`)
       }
@@ -564,29 +586,29 @@ const CrosswordGenerator = () => {
         {isGenerating && generatedIterations.length > 0 && (
           <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700/50 shadow-xl overflow-hidden mb-8">
             <div className="px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center justify-between">
-              <div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-400 to-blue-500 flex items-center justify-center animate-pulse"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg></div><h2 className="text-lg font-semibold text-white">Generowane iteracje</h2></div>
-              <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 animate-pulse">{generatedIterations.length} unikatowych</span>
+              <div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-400 to-blue-500 flex items-center justify-center animate-pulse"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg></div><h2 className="text-lg font-semibold text-white">Najlepsze iteracje</h2></div>
+              <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 animate-pulse">Top {Math.min(TOP_ITERATIONS_COUNT, generatedIterations.length)} z {generatedIterations.length}</span>
             </div>
-            <div className="p-5"><div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">{generatedIterations.map((iter, originalIndex) => ({ iter, originalIndex })).sort((a, b) => b.iter.score - a.iter.score).map(({ iter, originalIndex }, sortedIndex) => renderIterationCard(iter, originalIndex, sortedIndex, false))}</div></div>
+            <div className="p-5"><div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">{sortedIterations.slice(0, TOP_ITERATIONS_COUNT).map((iter, sortedIndex) => { const originalIndex = generatedIterations.findIndex(i => i.id === iter.id); return renderIterationCard(iter, originalIndex, sortedIndex, false) })}</div></div>
           </div>
         )}
         {!isGenerating && generatedIterations.length > 1 && (
           <div ref={iterationsRef} className="scroll-mt-5 bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700/50 shadow-xl overflow-hidden mb-8">
             <button onClick={() => setIterationsExpanded(!iterationsExpanded)} className="w-full px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center justify-between hover:bg-slate-700/50 transition-colors">
-              <div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-400 to-blue-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg></div><h2 className="text-lg font-semibold text-white">Wszystkie iteracje</h2></div>
+              <div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-400 to-blue-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg></div><h2 className="text-lg font-semibold text-white">Najlepsze iteracje</h2></div>
               <div className="flex items-center gap-3">
-                <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">{generatedIterations.length} unikatowych</span>
+                <span className="px-3 py-1 rounded-full text-xs font-medium bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">top {Math.min(TOP_ITERATIONS_COUNT, generatedIterations.length)} z {generatedIterations.length}</span>
                 <svg className={`w-5 h-5 text-slate-400 transition-transform duration-200 ${iterationsExpanded ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
               </div>
             </button>
-            {iterationsExpanded && <div className="p-5"><div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">{generatedIterations.map((iter, originalIndex) => ({ iter, originalIndex })).sort((a, b) => b.iter.score - a.iter.score).map(({ iter, originalIndex }, sortedIndex) => renderIterationCard(iter, originalIndex, sortedIndex, true))}</div></div>}
+            {iterationsExpanded && <div className="p-5"><div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">{topIterations.map((iter, sortedIndex) => { const originalIndex = generatedIterations.findIndex(i => i.id === iter.id); return renderIterationCard(iter, originalIndex, sortedIndex, true) })}</div></div>}
           </div>
         )}
         {!isGenerating && grid && placedWords.length > 0 && (
           <div className="grid lg:grid-cols-2 gap-6 mb-8">
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700/50 shadow-xl overflow-hidden flex flex-col">
               <div className="px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center justify-between"><div className="flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-rose-400 to-pink-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" /></svg></div><h2 className="text-lg font-semibold text-white">Umieszczone słowa</h2></div><span className="px-3 py-1 rounded-full text-xs font-medium bg-rose-500/20 text-rose-400 border border-rose-500/30">{placedWords.length}/{allPlacedWords.length} słów</span></div>
-              <div className="p-5 flex-1 overflow-y-auto max-h-[219px]"><div className="flex flex-wrap gap-2">{sorted.map((pw, i) => { const isHidden = hiddenWords.has(pw.word); return <button key={i} onClick={() => toggleWordVisibility(pw.word)} className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono transition-all duration-200 border group ${isHidden ? 'bg-slate-800/50 text-slate-500 border-slate-700/30 hover:bg-slate-700/50 hover:text-slate-400' : 'bg-slate-700/50 hover:bg-amber-500/20 text-slate-300 hover:text-amber-400 border-slate-600/30 hover:border-amber-500/30'}`} title={isHidden ? `Przywróć "${pw.word}"` : `Ukryj "${pw.word}"`}>{pw.word.toLowerCase()}{isHidden ? <svg className="w-3.5 h-3.5 opacity-50 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg> : <svg className="w-3.5 h-3.5 opacity-50 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>}</button> })}</div></div>
+              <div className="p-5 flex-1 overflow-y-auto max-h-[219px]"><div className="flex flex-wrap gap-2">{sorted.map((pw, i) => { const isHidden = hiddenWords.has(pw.word); const isDisconnectedHidden = disconnectedHiddenWords.has(pw.word); return <button key={i} onClick={() => toggleWordVisibility(pw.word)} className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono transition-all duration-200 border group ${isDisconnectedHidden ? 'bg-slate-800/50 text-slate-600 border-slate-700/30 cursor-not-allowed' : isHidden ? 'bg-slate-800/50 text-slate-500 border-slate-700/30 hover:bg-slate-700/50 hover:text-slate-400' : 'bg-slate-700/50 hover:bg-amber-500/20 text-slate-300 hover:text-amber-400 border-slate-600/30 hover:border-amber-500/30'}`} title={isDisconnectedHidden ? `"${pw.word}" – ukryte jako zależność` : isHidden ? `Przywróć "${pw.word}"` : `Ukryj "${pw.word}"`} disabled={isDisconnectedHidden}>{pw.word.toLowerCase()}{isHidden ? <svg className={`w-3.5 h-3.5 ${isDisconnectedHidden ? 'opacity-30' : 'opacity-50 group-hover:opacity-100'} transition-opacity`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" /></svg> : <svg className="w-3.5 h-3.5 opacity-50 group-hover:opacity-100 transition-opacity" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>}</button> })}</div></div>
             </div>
             <div className="bg-slate-800/50 backdrop-blur-sm rounded-2xl border border-slate-700/50 shadow-xl overflow-hidden flex flex-col">
               <div className="px-5 py-4 bg-slate-700/30 border-b border-slate-700/50 flex items-center gap-3"><div className="w-8 h-8 rounded-lg bg-gradient-to-br from-cyan-400 to-blue-500 flex items-center justify-center"><svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg></div><h2 className="text-lg font-semibold text-white">Opcje wyświetlania</h2></div>
