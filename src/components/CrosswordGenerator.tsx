@@ -409,7 +409,8 @@ const CrosswordGenerator = () => {
       generationProgress.current = i+1
       setStats(`Generowanie iteracji ${i + 1}/${GEN_ATTEMPTS}...`); await new Promise(r => setTimeout(r, 10))
       try {
-        const searchResult = await beamSearch(shuffle(words), 300, Math.random() > 0.5 ? 'across' : 'down')
+        const randomWidth = 50 + Math.floor(Math.random() * words.length*10)
+        const searchResult = await beamSearch(shuffle(words), randomWidth, Math.random() > 0.5 ? 'across' : 'down')
         const result = await retryFailed(searchResult)
         const b = getBounds(result.grid)
         const density = (result.grid.size / b.area) * 100
