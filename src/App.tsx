@@ -1,11 +1,9 @@
-import CrosswordGenerator from "./components/CrosswordGenerator.tsx"
+import GeneratorUI from "./components/GeneratorUI"
 
 function App() {
 
   return (
-    <>
-      <CrosswordGenerator />
-    </>
+    <GeneratorUI />
   )
 }
 
