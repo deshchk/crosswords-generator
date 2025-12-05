@@ -17,8 +17,8 @@ export const HINT_LINE_HEIGHT = 16
 export const HELPER_LINE_HEIGHT = 18
 export const WORD_HINT_MAX_WIDTH = 280
 export const GAP = 64
-export const GEN_ATTEMPTS = 100
-export const TOP_ITERATIONS_COUNT = 10
+export const GEN_ATTEMPTS = 200
+export const TOP_ITERATIONS_COUNT = 20
 
 export const getPos = (x: number, y: number, i: number, dir: Dir): [number, number] => dir === 'across' ? [x + i, y] : [x, y + i]
 
@@ -92,6 +92,66 @@ export const countFilledCellsFromGrid = (grid: Map<string, string>): number => {
   return filledCount
 }
 
+export const countOutliers = (grid: Map<string, string>): number => {
+  const bounds = getBounds(grid)
+  if (bounds.area <= 1) return 0
+  const width = bounds.width, height = bounds.height
+  const table = Array(height).fill(0).map(() => Array(width).fill(false))
+  const occupied = new Set<string>()
+
+  for (const key of grid.keys()) {
+    const [x, y] = key.split(',').map(Number)
+    table[y - bounds.minY][x - bounds.minX] = true
+    occupied.add(key)
+  }
+
+  const queue: [number, number][] = []
+  const visited = new Set<string>()
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if ((y === 0 || y === height - 1 || x === 0 || x === width - 1) && !table[y][x]) {
+        const k = `${x},${y}`
+        if (!visited.has(k)) { visited.add(k); queue.push([x, y]) }
+      }
+    }
+  }
+
+  while (queue.length) {
+    const [x, y] = queue.shift()!
+    for (const [nx, ny] of [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]]) {
+      if (nx >= 0 && nx < width && ny >= 0 && ny < height && !table[ny][nx]) {
+        const k = `${nx},${ny}`
+        if (!visited.has(k)) { visited.add(k); queue.push([nx, ny]) }
+      }
+    }
+  }
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!table[y][x] && !visited.has(`${x},${y}`)) {
+        occupied.add(`${x + bounds.minX},${y + bounds.minY}`)
+      }
+    }
+  }
+
+  const core = new Set<string>()
+  for (let y = bounds.minY; y < bounds.maxY; y++) {
+    for (let x = bounds.minX; x < bounds.maxX; x++) {
+      const p1 = `${x},${y}`, p2 = `${x + 1},${y}`, p3 = `${x},${y + 1}`, p4 = `${x + 1},${y + 1}`
+      if (occupied.has(p1) && occupied.has(p2) && occupied.has(p3) && occupied.has(p4)) {
+        core.add(p1); core.add(p2); core.add(p3); core.add(p4)
+      }
+    }
+  }
+
+  let outliers = 0
+  for (const cell of occupied) {
+    if (!core.has(cell)) outliers++
+  }
+  return outliers
+}
+
 export const calculateCompactness = (grid: Map<string, string>): number => {
   if (grid.size < 2) return 1
   const bounds = getBounds(grid)
@@ -133,12 +193,25 @@ export const findPlacements = (grid: Map<string, string>, word: string, remainin
 }
 
 export const scoreState = (state: BeamState) => {
+  const b = getBounds(state.grid)
+  const density = (state.grid.size / b.area) * 100
+  const intersections = countTotalIntersections(state.grid, state.placedWords)
+  const filledCellsCount = countFilledCellsFromGrid(state.grid)
   const intersectionsPerWord = countIntersectionsPerWord(state.grid, state.placedWords)
   let totalWordIntersections = 0
   for (const [, count] of intersectionsPerWord) { totalWordIntersections += count }
   const avgIntersections = state.placedWords.length > 0 ? totalWordIntersections / state.placedWords.length : 0
   const compactness = calculateCompactness(state.grid)
-  return (avgIntersections * compactness * 100)
+
+  const strategies = [
+    avgIntersections * compactness * 100,
+    avgIntersections,
+    density,
+    filledCellsCount + compactness * 10,
+    intersections + density * 10 + compactness + filledCellsCount
+  ]
+
+  return strategies[Math.floor(Math.random() * strategies.length)]
 }
 
 export const beamSearch = async (words: string[], beamWidth: number, initDir: Dir): Promise<BeamState> => {
@@ -400,7 +473,7 @@ export const useGeneratorLogic = () => {
     setSelectedIterationIndex(index); setGrid(iteration.grid); setPlacedWords(iteration.placedWords); setAllPlacedWords(iteration.placedWords); setHiddenWords(new Set()); setDisconnectedHiddenWords(new Set())
     const { password: p, numbers: n } = assignPassPositions(iteration.grid, preparePassword(passwordInput))
     setPassword(p); setGridNumbers(n)
-    setStats(`Iteracja ${iteration.id} ${isIterationBest(index) ? '(najlepsza)' : ''} | Avg intersections: ${iteration.avgIntersections.toFixed(2)} | Words: ${iteration.wordCount}/${iteration.totalWords}`)
+    setStats(`Iteracja ${iteration.id} ${isIterationBest(index) ? '(najlepsza)' : ''} | Avg intersections: ${iteration.avgIntersections.toFixed(2)} | Words used: ${iteration.wordCount}`)
   }
 
   const handleGenerate = async () => {
@@ -426,7 +499,10 @@ export const useGeneratorLogic = () => {
         const intersections = countTotalIntersections(result.grid, result.placedWords)
         const filledCellsCount = countFilledCellsFromGrid(result.grid)
         const compactness = calculateCompactness(result.grid)
-        const score = (avgIntersections * compactness * 100) + (b.area / 4 + filledCellsCount) * density / 4
+        const outliers = countOutliers(result.grid), outliersPenalty = (outliers * outliers)/2 + outliers * 2
+
+        const score = (avgIntersections * compactness * 100) + (b.area/4 + filledCellsCount) * density/4 - outliersPenalty
+
         const table: string[][] = Array(b.height).fill(0).map(() => Array(b.width).fill('-'))
         for (const [k, v] of result.grid) { const [x, y] = k.split(',').map(Number); table[y - b.minY][x - b.minX] = v }
         const normalizedWords = result.placedWords.map(pw => ({ ...pw, x: pw.x - b.minX, y: pw.y - b.minY }))
@@ -483,7 +559,7 @@ export const useGeneratorLogic = () => {
     const totalWidth = Math.max(gridWidth, hintsX + WORD_HINT_MAX_WIDTH, passwordWidth) + 40, totalHeight = passwordY + passwordSectionHeight + 20
     let newWord = 0
     return (
-      <svg ref={svgRef} viewBox={`-12 -20 ${totalWidth - 10} ${totalHeight}`} xmlns="http://www.w3.org/2000/svg" style={{ fontFamily: 'sans-serif', width: '100%', maxWidth: totalWidth + 'px', maxHeight: totalHeight + 'px' }}>
+      <svg ref={svgRef} viewBox={`-12 -20 ${totalWidth + 6} ${totalHeight}`} xmlns="http://www.w3.org/2000/svg" style={{ fontFamily: 'sans-serif', width: '100%', maxWidth: totalWidth + 'px', maxHeight: totalHeight + 'px' }}>
         <g style={{ filter: 'drop-shadow(1px 0 0 black) drop-shadow(0 1px 0 black) drop-shadow(-1px 0 0 black) drop-shadow(0 -1px 0 black)' }}>
           {grid.map((row, y) => row.map((cell, x) => {
             const isFilled = filledCells.has(`${x},${y}`), isVowel = POLISH_VOWELS.has(cell), isPolishChar = POLISH_SPECIAL_CHARS.has(cell), hasNumber = gridNumbers.has(`${x},${y}`), number = gridNumbers.get(`${x},${y}`), cellX = x * CELL_SIZE, cellY = y * CELL_SIZE
@@ -493,7 +569,7 @@ export const useGeneratorLogic = () => {
           }))}
         </g>
         <g transform={`translate(${hintsX}, 6)`}>
-          <rect x="-8" y="-8" width={WORD_HINT_MAX_WIDTH + 16} height={hintsHeight + 12} fill="white" stroke="#666" strokeWidth="1" rx="4" />
+          <rect x="-8" y="-8" width={WORD_HINT_MAX_WIDTH + 32} height={hintsHeight + 12} fill="white" stroke="#666" strokeWidth="1" rx="4" />
           {hintsContent.map((hint, idx) => <g key={idx} transform={`translate(0, ${hint.yOffset})`}><text x={0} y={12} fontSize="11" fill="black">•</text>{hint.lines.map((line, lineIdx) => <text key={lineIdx} x={10} y={12 + lineIdx * HINT_LINE_HEIGHT} fontSize="11" fill="black">{line}</text>)}</g>)}
         </g>
         {password.length > 0 && (
@@ -511,13 +587,15 @@ export const useGeneratorLogic = () => {
 
   const renderIterationCard = (iter: GeneratedIteration, originalIndex: number, sortedIndex: number, isButton: boolean) => {
     const isBest = isIterationBest(originalIndex), isSelected = originalIndex === selectedIterationIndex
+    const outliers = countOutliers(rebuildGrid(iter.placedWords))
     const className = `relative p-4 rounded-xl border-2 transition-all duration-200 text-left ${isSelected || (!isButton && isBest) ? 'bg-indigo-500/20 border-indigo-500 shadow-lg shadow-indigo-500/20' : 'bg-slate-700/30 border-slate-600/30' + (isButton ? ' hover:bg-slate-700/50 hover:border-slate-500/50' : '')}`
     const content = <>
       {isBest && <div className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-gradient-to-br from-amber-400 to-orange-500 flex items-center justify-center shadow-lg"><svg className="w-3.5 h-3.5 text-white" fill="currentColor" viewBox="0 0 20 20"><path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z" /></svg></div>}
       <div className="flex items-center justify-between mb-2"><span className={`text-sm font-bold ${isSelected || (!isButton && isBest) ? 'text-indigo-300' : 'text-slate-300'}`}>#{sortedIndex + 1}</span><span className="text-xs text-slate-500">iter {iter.id}</span></div>
       <div className="space-y-1">
         <div className="flex justify-between text-xs"><span className="text-slate-500">Gęstość:</span><span className={`font-mono ${iter.density >= 50 ? 'text-emerald-400' : iter.density > 30 ? 'text-amber-400' : 'text-red-400'}`}>{iter.density.toFixed(1)}%</span></div>
-        <div className="flex justify-between text-xs"><span className="text-slate-500">Przecięcia:</span><span className={`font-mono ${iter.avgIntersections > 2.25 ? 'text-emerald-400' : iter.avgIntersections > 2.15 ? 'text-amber-400' : 'text-red-400'}`}>{iter.intersections} ({iter.avgIntersections.toFixed(2)})</span></div>
+        <div className="flex justify-between text-xs"><span className="text-slate-500">Przecięcia<sup>(avg)</sup>:</span><span className={`font-mono tracking-tighter ${iter.avgIntersections > 2.25 ? 'text-emerald-400' : iter.avgIntersections > 2.15 ? 'text-amber-400' : 'text-red-400'}`}>{iter.intersections} <sup className="font-bold tracking-wide">{iter.avgIntersections.toFixed(1)}</sup></span></div>
+        <div className="flex justify-between text-xs"><span className="text-slate-500">Odstające:</span><span className={`font-mono ${outliers <= 7 ? 'text-emerald-400' : outliers <= 16 ? 'text-amber-400' : 'text-red-400'}`}>{outliers}</span></div>
         <div className="flex justify-between text-xs"><span className="text-slate-500">Wynik:</span><span className="font-mono text-slate-400">{iter.score.toFixed(2)}</span></div>
       </div>
     </>
